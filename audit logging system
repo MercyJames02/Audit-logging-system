@@ -1,0 +1,164 @@
+Audit-Logging-System/
+├── app/
+│   ├── __init__.py
+│   ├── routes.py
+│   ├── models.py
+│   ├── auth.py
+│   ├── database.py
+├── config/
+│   ├── config.py
+├── migrations/
+│   ├── README.md
+├── tests/
+│   ├── test_logging.py
+├── .env
+├── .gitignore
+├── Dockerfile
+├── docker-compose.yml
+├── requirements.txt
+├── README.md
+├── run.py
+
+# app/__init__.py
+from flask import Flask
+from config.config import Config
+from app.database import init_db
+
+def create_app():
+    app = Flask(__name__)
+    app.config.from_object(Config)
+    init_db(app)
+    
+    from app.routes import main
+    app.register_blueprint(main)
+    
+    return app
+
+# app/routes.py
+from flask import Blueprint, request, jsonify
+from app.models import AuditLog
+from app.auth import token_required
+
+main = Blueprint('main', __name__)
+
+@main.route('/log', methods=['POST'])
+@token_required
+def log_event(user_id):
+    data = request.json
+    log = AuditLog(user_id, data['event_type'], data['event_description'])
+    log.save_to_db()
+    return jsonify({'message': 'Log saved successfully', 'hash': log.hash})
+
+@main.route('/logs', methods=['GET'])
+@token_required
+def get_logs(user_id):
+    logs = AuditLog.get_logs_by_user(user_id)
+    return jsonify(logs)
+
+# app/models.py
+import datetime
+import hashlib
+from app.database import db
+
+class AuditLog(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, nullable=False)
+    event_type = db.Column(db.String(255), nullable=False)
+    event_description = db.Column(db.Text, nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    hash = db.Column(db.String(64), nullable=False)
+
+    def __init__(self, user_id, event_type, event_description):
+        self.user_id = user_id
+        self.event_type = event_type
+        self.event_description = event_description
+        self.timestamp = datetime.datetime.utcnow()
+        self.hash = self.generate_hash()
+    
+    def generate_hash(self):
+        data = f"{self.user_id}{self.event_type}{self.event_description}{self.timestamp}"
+        return hashlib.sha256(data.encode()).hexdigest()
+
+    def save_to_db(self):
+        db.session.add(self)
+        db.session.commit()
+
+    @staticmethod
+    def get_logs_by_user(user_id):
+        return [log.as_dict() for log in AuditLog.query.filter_by(user_id=user_id).all()]
+
+# app/auth.py
+import jwt
+import datetime
+from flask import request, jsonify
+from functools import wraps
+from config.config import Config
+
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get('Authorization')
+        if not token:
+            return jsonify({'message': 'Token is missing!'}), 403
+        try:
+            data = jwt.decode(token, Config.SECRET_KEY, algorithms=['HS256'])
+        except:
+            return jsonify({'message': 'Token is invalid!'}), 403
+        return f(data['user_id'], *args, **kwargs)
+    return decorated
+
+# app/database.py
+from flask_sqlalchemy import SQLAlchemy
+
+db = SQLAlchemy()
+
+def init_db(app):
+    app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://postgres:password@localhost/audit_logs'
+    db.init_app(app)
+    with app.app_context():
+        db.create_all()
+
+# config/config.py
+class Config:
+    SECRET_KEY = 'your_secret_key'
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+
+# Dockerfile
+FROM python:3.9
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY . .
+CMD ["python", "run.py"]
+
+# docker-compose.yml
+version: '3.8'
+services:
+  web:
+    build: .
+    ports:
+      - "5000:5000"
+    depends_on:
+      - db
+  db:
+    image: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: audit_logs
+    ports:
+      - "5432:5432"
+
+# requirements.txt
+Flask
+Flask-SQLAlchemy
+PyJWT
+psycopg2-binary
+
+# run.py
+from app import create_app
+
+app = create_app()
+
+if __name__ == '__main__':
+    app.run(debug=True)
